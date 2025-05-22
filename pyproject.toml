@@ -1,0 +1,14 @@
+[project]
+name = "langgraph-fastapi-streaming"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "duckduckgo-search>=8.0.1",
+    "fastapi[standard]>=0.115.12",
+    "langchain-community>=0.3.24",
+    "langchain-openai>=0.3.16",
+    "langgraph>=0.4.3",
+    "loguru>=0.7.3",
+]
