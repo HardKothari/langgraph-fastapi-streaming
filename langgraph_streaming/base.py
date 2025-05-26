@@ -11,7 +11,15 @@ from pydantic import BaseModel
 
 # Langchain Imports
 from langchain_core.runnables.config import RunnableConfig
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, ToolMessageChunk, AIMessageChunk, AnyMessage
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+    ToolMessageChunk,
+    AIMessageChunk,
+    AnyMessage,
+    BaseMessage
+)
 from langgraph.graph.state import CompiledStateGraph, StateGraph
 from langgraph.graph.message import MessagesState
 from langgraph.types import Command, Interrupt
@@ -74,8 +82,7 @@ class BaseAgent(ABC):
 
     def __init__(self) -> None:
         # Initialize agent during instance creation
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._initialize_agent())
+        self._initialize_agent()
 
     @property
     def name(cls) -> str:
@@ -125,7 +132,7 @@ class BaseAgent(ABC):
         return AIMessage(**filtered)
 
     @classmethod
-    async def initialize_checkpointer(cls):
+    def initialize_checkpointer(cls):
 
         cls.checkpointer = cls._get_checkpointer()
 
@@ -134,7 +141,7 @@ class BaseAgent(ABC):
             cls.checkpointer = MemorySaver()
 
     @classmethod
-    async def create_graph(cls) -> CompiledStateGraph:
+    def create_graph(cls) -> CompiledStateGraph:
         """
         Create the graph and assign a checkpointer
         """
@@ -142,7 +149,7 @@ class BaseAgent(ABC):
         graph: CompiledStateGraph = cls._compile_graph()
 
         if cls.checkpointer is None:
-            await cls.initialize_checkpointer()
+            cls.initialize_checkpointer()
 
         graph.checkpointer = cls.checkpointer
 
@@ -153,10 +160,10 @@ class BaseAgent(ABC):
         return graph
 
     @classmethod
-    async def _initialize_agent(cls) -> None:
+    def _initialize_agent(cls) -> None:
         """Initialize the agent"""
         if cls._agent is None:
-            cls._agent = await cls.create_graph()
+            cls._agent = cls.create_graph()
 
     @classmethod
     def _get_agent_config(cls, config: Optional[RunnableConfig] = None) -> Optional[BaseModel]:
@@ -182,6 +189,10 @@ class BaseAgent(ABC):
         Get chat history
         """
         try:
+            if not self.checkpointer:
+                raise ValueError(
+                    "Checkpointer is not available for agent to retrieve message history.")
+
             state_snapshot = self.agent.get_state(
                 config=RunnableConfig(
                     configurable={
@@ -190,9 +201,7 @@ class BaseAgent(ABC):
                 )
             )
             messages: List[AnyMessage] = state_snapshot.values["messages"]
-            chat_messages: List[AgentMessage] = [
-                langchain_to_chat_message(m) for m in messages]
-            return ChatHistory(messages=chat_messages)
+            return messages
         except Exception as e:
             logger.error(f"An exception occurred: {e}")
             raise HTTPException(status_code=500, detail="Unexpected error")
@@ -233,7 +242,10 @@ class BaseAgent(ABC):
             run_id = uuid4()
 
         # Getting thread_id from input
-        thread_id = user_input.thread_id or str(uuid4())
+        if self.checkpointer:
+            thread_id = user_input.thread_id or str(uuid4())
+        else:
+            thread_id = None
 
         # Adding thread_id into configurable
         configurable = {"thread_id": thread_id}
@@ -261,36 +273,42 @@ class BaseAgent(ABC):
         else:
             config = user_input.runnable_config
             config["configurable"] = configurable
+            config["run_id"] = run_id
 
         ########
         # Creating inpute paramter for agent
         ########
 
         # Check for interrupts that need to be resumed
-        state = await self.agent.aget_state(config=config)
-        interrupted_tasks = [
-            task for task in state.tasks if hasattr(task, "interrupts") and task.interrupts
-        ]
+        if self.checkpointer:
+            state = await self.agent.aget_state(config=config)
+            interrupted_tasks = [
+                task for task in state.tasks if hasattr(task, "interrupts") and task.interrupts
+            ]
+        else:
+            interrupted_tasks = []
 
         input: Command | dict[str, Any]
 
-        # If interrupt, then use Command to handle the interrupt response
-        if isinstance(user_input.messages, str):
-            # Converting input based on interruption or as human message.
-            if interrupted_tasks:
-                # assume user input is response to resume agent execution from interrupt
-                input = Command(resume=user_input.messages if isinstance(
-                    user_input.messages, str) else user_input.messages[-1])
-            else:
+        if interrupted_tasks and len(interrupted_tasks) > 0:
+            # If interrupt, then use Command to handle the interrupt response
+            input = Command(resume=user_input.messages if isinstance(
+                user_input.messages, str) else user_input.messages[-1])
+        else:
+            if isinstance(user_input.messages, str):
+                # Converting input based on interruption or as human message.
                 input = {"messages": [HumanMessage(content=user_input.messages)],
                          **user_input.agent_input}
-        else:
-            messages = []
-            for message in user_input.messages:
-                if isinstance(message, AnyMessage):
-                    messages.append(message)
-                else:
-                    messages.append(self._convert_to_lc_message(message))
+            else:
+                messages = []
+                for message in user_input.messages:
+                    if isinstance(message, BaseMessage):
+                        messages.append(message)
+                    else:
+                        messages.append(self._convert_to_lc_message(message))
+
+                input = {"messages": messages,
+                         **user_input.agent_input}
 
         # Converting the input into langchain format input for runnables
         kwargs = {
@@ -300,7 +318,7 @@ class BaseAgent(ABC):
 
         return kwargs
 
-    async def ainvoke(self, user_input: UserInput) -> AgentMessage:
+    async def ainvoke(self, user_input: UserInput) -> AnyMessage:
         """Invoking Agent"""
         # Handling the generic input
         kwargs = await self._handle_input(user_input)
@@ -309,7 +327,7 @@ class BaseAgent(ABC):
         run_id: UUID = kwargs["config"]["run_id"]
 
         # Extracting thread_id from user imnput
-        thread_id: UUID = kwargs["config"]["configurable"]["thread_id"]
+        thread_id: Optional[UUID] = kwargs["config"]["configurable"]["thread_id"]
 
         # Using the input for agent
         # type: ignore # fmt: skip
@@ -327,7 +345,7 @@ class BaseAgent(ABC):
 
         # Constructing the final message from state of agent
         msg = ""
-        kwargs = {}
+        kwargs: Dict[str, Any] = {}
 
         if isinstance(message.content, str):
             msg = message.content
@@ -337,11 +355,12 @@ class BaseAgent(ABC):
         kwargs.update(message.additional_kwargs)
 
         # Adding run_id, thread_id and state in kwargs
-        kwargs["run_id"] = str(run_id)
-        kwargs["thread_id"] = str(thread_id)
+        kwargs["run_id"] = str(run_id)  # type: ignore
+        kwargs["thread_id"] = str(  # type: ignore
+            thread_id) if thread_id else None
 
         # Removing messages from state
-        kwargs["state"] = {k: v for k,
+        kwargs["state"] = {k: v for k,   # type: ignore
                            v in response.items() if k != "messages"}
 
         # TO DO: Implement adding usage_metadata from agent output into kwargs
@@ -377,10 +396,10 @@ class BaseAgent(ABC):
         run_id: UUID = kwargs["config"]["run_id"]
 
         # Extracting thread_id from user imnput
-        thread_id: UUID = kwargs["config"]["configurable"]["thread_id"]
+        thread_id: Optional[UUID] = kwargs["config"]["configurable"]["thread_id"]
 
         run_args = {"run_id": str(run_id),
-                    "thread_id": str(thread_id)}
+                    "thread_id": str(thread_id) if thread_id else None}
 
         all_messages_start_ids = []
         all_messages_end_ids = []
@@ -588,7 +607,7 @@ class BaseAgent(ABC):
 
             outputs.append(
                 ToolMessage(
-                    content=content,
+                    content=content,  # type: ignore
                     name=tool_call["name"],
                     tool_call_id=tool_call["id"],
                     additional_kwargs=kwargs

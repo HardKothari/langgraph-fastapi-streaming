@@ -9,6 +9,9 @@ dependencies = [
     "fastapi[standard]>=0.115.12",
     "langchain-community>=0.3.24",
     "langchain-openai>=0.3.16",
+    "langgraph-prebuilt>=0.1.8",
     "langgraph>=0.4.3",
     "loguru>=0.7.3",
+    "langgraph-checkpoint-sqlite>=2.0.10",
+    "langgraph-checkpoint-postgres>=2.0.21",
 ]
